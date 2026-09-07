@@ -167,10 +167,12 @@ drivers.
 
 ### Non-Goals
 
-- In-tree FibreChannel and iSCSI. They derive their state from `/proc/mounts`
+- In-tree FibreChannel and iSCSI. They stay in-tree until someone writes a
+  compatible replacement, and they derive their state from `/proc/mounts`
   rather than from a state file, so this failure mode takes a different shape
-  there. The same recovery could be built for them, but it is out of scope
-  here, and both are migrating to CSI.
+  there. Both could benefit from the same recovery, and someone may implement
+  global mount reconstruction for them in a similar way to the CSI plugin, but
+  it is out of scope here. NFS does not use `MountDevice` and is unaffected.
 - The pod-local fallback for raw block volumes. Block volumes keep no pod-local
   `vol_data.json` to lose: `NewBlockVolumeMapper` writes theirs to
   `plugins/kubernetes.io/csi/volumeDevices/<specVolID>/data`, already
