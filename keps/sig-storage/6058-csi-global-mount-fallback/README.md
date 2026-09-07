@@ -193,26 +193,14 @@ drivers.
 with `volumeHandle` and `driverName`. We extend it to also write `specVolID`
 (the PV name, equal to the basename of the pod-local mount path) and
 `volumeLifecycleMode` (hardcoded to `Persistent` since `MountDevice` only
-runs for device-mountable volumes). With those four fields the global file
-contains everything `ConstructVolumeSpec` needs to rebuild a
-`volume.Spec`; no behavior change on its own.
+runs for device-mountable volumes). With those fields the global file names the volume it belongs to, which is
+what lets reconstruction start from it with no pod directory in hand. Writing
+them changes no behavior on its own.
 
-`ConstructVolumeSpec` is changed to fall back to the global file when the
-pod-local load fails. It asks the mount table which global mount the pod-local
-mount is bound to: `NodePublishVolume` publishes the staged volume into the pod
-directory, which drivers implement as a bind mount from the staging path, so
-the global mount is a mount reference of `<mountPath>/mount` and the data
-directory is its parent. If no global mount is bind mounted there, or its
-`vol_data.json` names no driver and no volume handle, reconstruction fails as
-today.
-
-The fallback is wrapped by `utilfeature.DefaultFeatureGate.Enabled(features.CSIGlobalMountReconstruction)`.
-With the gate off, `ConstructVolumeSpec` behaves exactly as before. With the
-gate on, only the failure path is altered: the success path is unchanged.
-
-The fallback above still starts from a pod directory. To also cover global
-mounts whose pod directory no longer exists, the reconstruction pass gains a
-second, independent source of candidates: a scan of
+Reconstruction today enumerates candidates only from `/var/lib/kubelet/pods`,
+so a global mount whose pod directory is gone is never visited. The
+reconstruction pass gains a second, independent source of candidates: a scan
+of
 `/var/lib/kubelet/plugins/kubernetes.io/csi/*/*`, the parent directories of
 every CSI global mount on the node. For each directory found that is not
 already tracked in the ActualStateOfWorld:
@@ -237,6 +225,21 @@ completes, so the attach/detach controller cannot start a competing attach
 in the middle of the cleanup. The scan is gated by the same
 `CSIGlobalMountReconstruction` feature gate; with the gate off,
 reconstruction scans only `/var/lib/kubelet/pods` as today.
+
+The scan starts from the plugin directory, so it cannot help the case where the
+pod directory is still present and it is the pod-local `vol_data.json` that is
+unreadable. For that, `ConstructVolumeSpec` is changed to fall back to the
+global file when the pod-local load fails. It asks the mount table which global mount the pod-local
+mount is bound to: `NodePublishVolume` publishes the staged volume into the pod
+directory, which drivers implement as a bind mount from the staging path, so
+the global mount is a mount reference of `<mountPath>/mount` and the data
+directory is its parent. If no global mount is bind mounted there, or its
+`vol_data.json` names no driver and no volume handle, reconstruction fails as
+today.
+
+The fallback is wrapped by `utilfeature.DefaultFeatureGate.Enabled(features.CSIGlobalMountReconstruction)`.
+With the gate off, `ConstructVolumeSpec` behaves exactly as before. With the
+gate on, only the failure path is altered: the success path is unchanged.
 
 ### User Stories
 
@@ -636,11 +639,11 @@ orphaned global mount as uncertain and when its directory is removed after
 a successful unstage.
 
 The `reconstruct_volume_operations_total` metric already exists in kubelet at
-ALPHA stability, today as an unlabelled counter incremented once per pod volume
-directory reconstruction attempts, with
+ALPHA stability, today as an unlabelled counter incremented once per pod
+volume directory reconstruction attempt, with
 `reconstruct_volume_operations_errors_total` counting the failures among them.
 As part of this KEP we plan to add a label to it distinguishing `pod-local`
-from `global-mount`, which turns the counter into a labelled one; its alpha
+from `global-mount`, which turns the counter into a labelled one, a `NewCounter` to `NewCounterVec` change across its callers; its alpha
 stability allows that without a deprecation cycle. The orphaned global mount
 scan increments it too, so a mount recovered with no pod directory is counted
 rather than invisible.
@@ -651,8 +654,10 @@ Look for the V(2) log line above; or, after beta, inspect the metric label.
 
 ###### What are the reasonable SLOs (Service Level Objectives) for the enhancement?
 
-On the happy path the fallback costs one parse of `/proc/self/mountinfo` and
-one file read, tens of milliseconds. `GetReliableMountRefs` retries for up to
+The scan runs once per kubelet start, over a directory tree bounded by the CSI
+volumes staged on the node, and reads one small file per entry. On the happy
+path the pod-local fallback costs one parse of `/proc/self/mountinfo` and one
+file read, tens of milliseconds. `GetReliableMountRefs` retries for up to
 one minute when the mount table reads inconsistently, so a pathological node
 can spend that long per attempt; kubelet startup does not block on it, the
 reconciler retries.
@@ -667,7 +672,8 @@ reconciler retries.
 
 ###### Are there any missing metrics that would be useful to have to improve observability of this feature?
 
-A separate counter for fallback successes vs failures will be added at beta.
+The labelled counter described above distinguishes the two recovery paths at
+beta, so an operator can see which one is firing.
 
 ### Dependencies
 
@@ -701,7 +707,8 @@ Yes, on the `Node` object, and that growth is the fix rather than a cost of it.
 the node still holds, and it is the attach/detach controller's only interlock
 against detaching a device that is still staged: `processVolumesInUse` copies
 the list into the controller's actual state of world as `MountedByNode`, and its
-detach reconciler skips any volume carrying that flag. A global mount that
+detach reconciler skips any volume carrying that flag unless a force detach or
+the `node.kubernetes.io/out-of-service` taint overrides it. A global mount that
 outlived a kubelet restart is still staged, so it belongs in that list by the
 field's own definition, and that it is missing today is the defect that lets
 the controller attach the volume elsewhere and produce the double mount
@@ -793,8 +800,11 @@ gate and report the bug.
 
 ## Drawbacks
 
-The fallback adds a small amount of complexity to the CSI plugin's
-reconstruction path. The mitigating factor is that the alternative is to keep
+The plugin directory scan adds a second candidate source to reconstruction,
+which is the larger of the two changes: it registers volumes in the
+ActualStateOfWorld that no pod asked about, and lets the volume manager unstage
+and remove directories on that basis. The pod-local fallback adds a smaller
+amount of complexity to the CSI plugin's reconstruction path. The mitigating factor is that the alternative is to keep
 shipping a known data-corruption bug behind the documentation in KEP-3756.
 
 ## Alternatives
