@@ -322,9 +322,9 @@ manager reconstruction pass:
    in the ActualStateOfWorld. Notably it keys off the stored `volumeHandle`
    rather than `specVolID`, which is what lets it recover global mounts written
    by a kubelet that predates this KEP, where no `specVolID` was persisted. What
-   that PR lacks is the feature gate and the enhancement that a kubelet behavior
-   change of this shape requires, which is what this document supplies. The
-   intent is to land that work under this KEP rather than to duplicate it.
+   that PR does not carry is a feature gate. Whether this path lands there as the
+   [#121937][] bug fix or here behind the gate is for SIG Storage to decide; this
+   KEP tracks it either way rather than proposing a duplicate.
 
 Feature gate registration is in `pkg/features/kube_features.go` with
 `Default: false, PreRelease: featuregate.Alpha`.
