@@ -271,7 +271,7 @@ volume detaches cleanly without operator involvement.
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Wrong global file is matched (specVolID collision across drivers) | Very low: specVolID is the PV name, unique cluster-wide | Only the first matching file is used; both files must agree on driverName for the spec to be valid; mismatch surfaces as a downstream error |
+| Wrong global file is matched (specVolID collision across drivers) | Very low: specVolID is the PV name, and PV names are unique cluster-wide | The scan stops at the first file whose stored `specVolID` matches. It deliberately does not cross-check `driverName`, because the pod-local file that would carry it is the one that failed to load; a wrong match surfaces downstream as a driver that does not recognize the volume handle |
 | Global vol_data.json is also corrupt | Medium: same root cause may have hit both files | Fallback returns an error and reconstruction fails with the original message plus a wrapped fallback message; behavior matches the no-fallback case |
 | Feature gate disabled mid-cluster (skew) | Low | Field additions to global vol_data.json are written unconditionally (gate guards the read fallback only), so a node with the gate disabled still produces files a future enabled node can use |
 | Stale global mount data after volume detach | Low | Detach unmounts and removes the global mount directory along with `vol_data.json`; if detach failed previously this KEP is exactly what is supposed to recover from it |
@@ -314,6 +314,17 @@ manager reconstruction pass:
    `UnmountDevice` / `NodeUnstageVolume` and removes the directory after a
    successful unstage; one that is neither empty nor readable is logged as
    an error and left for operator intervention, as today.
+
+   An implementation of this second path already exists as
+   [#136771](https://github.com/kubernetes/kubernetes/pull/136771), opened by
+   @shivamwayal37 in February 2026 against issue [#121937][] and reviewed over
+   four rounds. It scans the same directories and marks what it finds uncertain
+   in the ActualStateOfWorld. Notably it keys off the stored `volumeHandle`
+   rather than `specVolID`, which is what lets it recover global mounts written
+   by a kubelet that predates this KEP, where no `specVolID` was persisted. What
+   that PR lacks is the feature gate and the enhancement that a kubelet behavior
+   change of this shape requires, which is what this document supplies. The
+   intent is to land that work under this KEP rather than to duplicate it.
 
 Feature gate registration is in `pkg/features/kube_features.go` with
 `Default: false, PreRelease: featuregate.Alpha`.
@@ -543,7 +554,11 @@ global mount in the first place); this is already standard.
 
 ###### Will enabling / using this feature result in any new API calls?
 
-No.
+No new call types. The orphaned global mount scan registers what it finds in
+the ActualStateOfWorld, so those volumes appear in the node status update
+kubelet already sends: `node.status.volumesInUse` carries one extra entry per
+recovered mount until `NodeUnstageVolume` completes. No additional request is
+issued, the existing periodic update carries a slightly longer list.
 
 ###### Will enabling / using this feature result in introducing new API types?
 
@@ -555,7 +570,10 @@ No.
 
 ###### Will enabling / using this feature result in increasing size or count of the existing API objects?
 
-No.
+Marginally, and only on the affected node. `node.status.volumesInUse` gains one
+entry per orphaned global mount the scan recovers, for as long as the reconciler
+takes to unstage it. The count is bounded by the global mounts that outlived a
+kubelet restart, which on a healthy node is zero.
 
 ###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
 
@@ -575,8 +593,14 @@ No.
 
 ###### How does this feature react if the API server and/or etcd is unavailable?
 
-The feature runs only at kubelet startup during local volume reconstruction
-and does not contact the API server.
+Reconstruction itself reads local disk only and completes without the API
+server, including both recovery paths. Acting on what the scan found does need
+it: the reconciler decides whether a recovered mount is still wanted by
+comparing against the desired state of world, which kubelet populates from the
+API server. With the API server unavailable that comparison never runs, the
+recovered mounts stay *uncertain*, and nothing is unstaged. That is the safe
+direction to fail, because the feature never removes a mount it cannot prove is
+unwanted.
 
 ###### What are other known failure modes?
 
@@ -607,6 +631,10 @@ gate and report the bug.
   volume manager call `NodeUnstageVolume` before removing the directory
   (empty directories removed directly).
 - 2026-09-06: Retargeted to alpha in v1.38 and moved to `implementable`.
+- 2026-09-07: Credited [#136771](https://github.com/kubernetes/kubernetes/pull/136771)
+  as the existing implementation of the orphaned global mount scan, and corrected
+  the Scalability and Troubleshooting answers, which had been written for the
+  narrower pod-local design and no longer described the scan.
 
 ## Drawbacks
 
