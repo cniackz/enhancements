@@ -1,4 +1,4 @@
-title: CSI global mount fallback for volume reconstruction
+title: CSI global mount reconstruction
 kep-number: 6058
 authors:
   - "@cniackz"
@@ -33,7 +33,7 @@ milestone:
 
 # The following PRR answers are required at alpha release
 feature-gates:
-  - name: VolumeReconstructionFallback
+  - name: CSIGlobalMountReconstruction
     components:
       - kubelet
 disable-supported: true
