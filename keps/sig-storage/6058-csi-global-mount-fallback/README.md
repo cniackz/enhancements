@@ -178,11 +178,12 @@ contains everything `ConstructVolumeSpec` needs to rebuild a
 `volume.Spec`; no behavior change on its own.
 
 `ConstructVolumeSpec` is changed to fall back to the global file when the
-pod-local load fails. It derives the `specVolID` from the basename of the
-pod-local mount path (this is how kubelet names the directory) and scans
-`/var/lib/kubelet/plugins/kubernetes.io/csi/*/*/vol_data.json` for a file
-whose stored `specVolID` matches. The first match is used. If no match is
-found (or the directory cannot be scanned), reconstruction fails as today.
+pod-local load fails. It asks the mount table which global mount the pod-local
+mount is bound to: `SetUpAt` bind mounts the global mount into the pod
+directory, so it is a mount reference of `<mountPath>/mount`, and the data
+directory is its parent. If no global mount is bind mounted there, or its
+`vol_data.json` names no driver and no volume handle, reconstruction fails as
+today.
 
 The fallback is wrapped by `utilfeature.DefaultFeatureGate.Enabled(features.VolumeReconstructionFallback)`.
 With the gate off, `ConstructVolumeSpec` behaves exactly as before. With the
@@ -253,17 +254,12 @@ volume detaches cleanly without operator involvement.
 
 ### Notes/Constraints/Caveats
 
-- The fallback relies on `specVolID` being unique within a node. This is true
-  by construction: `specVolID` is the PV name and a node has at most one mount
-  per PV.
-- Scanning `/var/lib/kubelet/plugins/kubernetes.io/csi/*/*/vol_data.json` is
-  bounded by the number of CSI volumes attached to the node (typically tens,
-  not thousands). The scan happens once per failed pod-local load during
-  reconstruction.
-- The fallback is per-pod-mount: if N pod-local files are missing, the scan
-  runs N times. This is acceptable at alpha; if it shows up in profiles we
-  will cache the scan result for the duration of a single reconstruction
-  pass at beta.
+- The fallback relies on the pod-local bind mount still being present, which
+  is the case it exists for: reconstruction runs before `cleanupMounts`, and a
+  global mount leaks precisely because nothing unmounted it.
+- Reading the mount table costs one parse of `/proc/self/mountinfo` per failed
+  pod-local load, through `GetReliableMountRefs`, which volume reconstruction
+  already uses elsewhere for the same reason.
 - The orphaned global mount scan runs once per reconstruction pass (that
   is, once per kubelet startup), over the same bounded set of directories.
 
@@ -271,7 +267,7 @@ volume detaches cleanly without operator involvement.
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Wrong global file is matched (specVolID collision across drivers) | Very low: specVolID is the PV name, and PV names are unique cluster-wide | The scan stops at the first file whose stored `specVolID` matches. It deliberately does not cross-check `driverName`, because the pod-local file that would carry it is the one that failed to load; a wrong match surfaces downstream as a driver that does not recognize the volume handle |
+| Wrong global mount is matched | None by construction | The pairing comes from the mount table, so the only global mount the fallback can return is the one this pod-local mount is bound to. An earlier revision matched on the directory name and could pair an inline ephemeral volume with an unrelated PV of the same name |
 | Global vol_data.json is also corrupt | Medium: same root cause may have hit both files | Fallback returns an error and reconstruction fails with the original message plus a wrapped fallback message; behavior matches the no-fallback case |
 | Feature gate disabled mid-cluster (skew) | Low | Field additions to global vol_data.json are written unconditionally (gate guards the read fallback only), so a node with the gate disabled still produces files a future enabled node can use |
 | Stale global mount data after volume detach | Low | Detach unmounts and removes the global mount directory along with `vol_data.json`; if detach failed previously this KEP is exactly what is supposed to recover from it |
@@ -289,18 +285,32 @@ manager reconstruction pass:
    unconditional: written regardless of the feature gate, so a downgrade does
    not produce stale or partial files.
 
-2. `csi_util.go`: new helper `findGlobalMountDataBySpecVolID(pluginDir, specVolID)`
-   that does the glob, opens each match via the existing `loadVolumeData`,
-   compares stored `specVolID`, and returns the first match's directory and
-   parsed contents. Errors per-file are logged at V(4) and skipped; only a
-   "no match found" condition is propagated up.
+2. `csi_util.go`: new helper `findGlobalMountDataFromPodMount(host, pluginName, mountPath)`
+   that asks the mount table which global mount the pod-local mount belongs to.
+   `SetUpAt` bind mounts the global mount into the pod directory, so
+   `GetReliableMountRefs` on `<mountPath>/mount` returns it, and the data
+   directory is its parent. A reference is accepted when it is named
+   `globalmount` and the `vol_data.json` beside it names both a driver and a
+   volume handle. References that fail either check are logged at V(4) and
+   skipped; "no global mount is bind mounted here" is propagated up.
+
+   The mount table is what makes this unambiguous. Matching on the directory
+   name instead is not sound: `Spec.Name()` is the PV name for a persistent
+   volume but the pod-spec entry for an inline ephemeral volume, and those two
+   namespaces overlap, so a name like `data` can denote both. An inline volume
+   also never stages a global mount of its own, because `CanDeviceMount` is
+   false for ephemeral, so every name match it could produce would belong to
+   somebody else's volume. Reading it from the mount table also works for
+   global mounts staged by a kubelet that predates this KEP, since it needs no
+   field that was not already written.
 
 3. `csi_plugin.go`: `ConstructVolumeSpec` calls `loadVolumeData` as today.
-   On error, if `VolumeReconstructionFallback` is enabled, it derives
-   `specVolID` from `filepath.Base(mountPath)`, calls the helper, and on
-   success continues with the parsed map. On failure of both loads, it
+   On error, if `VolumeReconstructionFallback` is enabled, it calls the helper
+   and on success continues with the parsed map. On failure of both loads, it
    returns the original error plus the fallback error in a wrapped message.
-   The success path is unchanged.
+   The success path is unchanged. The case this fallback cannot reach, a
+   global mount whose pod-local bind mount is already gone, is what item 4
+   below covers by scanning independently of the pod directories.
 
 4. `pkg/kubelet/volumemanager` (reconstruction): after the existing scan of
    `/var/lib/kubelet/pods`, a new step scans
@@ -319,10 +329,10 @@ manager reconstruction pass:
    [#136771](https://github.com/kubernetes/kubernetes/pull/136771), opened by
    @shivamwayal37 in February 2026 against issue [#121937][] and reviewed over
    four rounds. It scans the same directories and marks what it finds uncertain
-   in the ActualStateOfWorld. Notably it keys off the stored `volumeHandle`
-   rather than `specVolID`, which is what lets it recover global mounts written
-   by a kubelet that predates this KEP, where no `specVolID` was persisted. What
-   that PR does not carry is a feature gate. Whether this path lands there as the
+   in the ActualStateOfWorld. What that PR does not carry is a feature gate.
+   Note also that it reaches the ActualStateOfWorld through `reconstructVolume`,
+   which calls `ConstructVolumeSpec`, so it reads the `specVolID` that item 1
+   adds: without that field the reconstructed volume has an empty name. Whether this path lands there as the
    [#121937][] bug fix or here behind the gate is for SIG Storage to decide; this
    KEP tracks it either way rather than proposing a duplicate.
 
@@ -343,19 +353,28 @@ None.
 
 Coverage for the changed packages:
 
-- `k8s.io/kubernetes/pkg/volume/csi`: 76.2% (no significant change)
+- `k8s.io/kubernetes/pkg/volume/csi`: 77.7%
 
-New unit test `TestPluginConstructVolumeSpecFallsBackToGlobalMount` in
-`pkg/volume/csi/csi_plugin_test.go`, already part of the implementation PR
-[#138454](https://github.com/kubernetes/kubernetes/pull/138454), exercises
-the fallback path:
+Unit tests in `pkg/volume/csi`, already part of the implementation PR
+[#138454](https://github.com/kubernetes/kubernetes/pull/138454), cover both
+sides of the gate and the ways the lookup can go wrong:
 
-1. Pod-local `vol_data.json` is absent.
-2. A complete global `vol_data.json` (with all four fields) exists at
-   `<plugin-dir>/<driver>/<hash>/vol_data.json`.
-3. With the feature gate enabled, `ConstructVolumeSpec` returns a valid
-   `volume.Spec` rebuilt from the global file.
-4. With the feature gate disabled, the same call returns the original error.
+1. Pod-local `vol_data.json` absent, the pod mount still bind mounted from the
+   global one: with the gate enabled `ConstructVolumeSpec` returns a
+   `volume.Spec` rebuilt from the global file, and with the gate disabled the
+   same call returns the original error.
+2. An inline ephemeral volume whose short name matches an unrelated staged
+   PersistentVolume is not paired with it, because it shares no mount with
+   anything under the plugin directory.
+3. A pod mount with no mount references is reported as such rather than
+   guessed at.
+4. A mount reference whose `vol_data.json` is unreadable or names no driver is
+   skipped rather than trusted.
+
+Both recovery paths were also exercised end to end on a kind cluster running a
+kubelet built from this branch, confirming that a volume whose pod-local file
+was removed is recovered from its global mount and that a same-named inline
+volume is not.
 
 For the orphaned global mount scan, new unit tests in
 `pkg/kubelet/volumemanager` will cover:
@@ -483,11 +502,12 @@ Already running workloads are unaffected: the code path is not reached for
 volumes that are already mounted and tracked in memory.
 
 A rollout failure would manifest as a spurious successful reconstruction
-that uses incorrect data. Mitigation: the helper compares `specVolID` exactly
-and refuses to proceed without a match; the resulting `volume.Spec` is built
-from the same fields that the pod-local file would have provided, so any
-downstream component that previously trusted the pod-local file can trust
-the global file.
+that uses incorrect data. Mitigation: the global mount is identified by the
+mount reference the pod-local mount holds, not by a name that could be shared,
+so the only file the fallback can read is the one belonging to this very
+volume. The resulting `volume.Spec` is built from the same fields the
+pod-local file would have provided, so any downstream component that
+previously trusted the pod-local file can trust the global file.
 
 For the orphaned global mount scan, the failure to watch for is unstaging a
 volume a pod still needs. The uncertain registration prevents that: the
@@ -513,7 +533,7 @@ No.
 ###### How can an operator determine if the feature is in use by workloads?
 
 At alpha: kubelet logs at V(2) emit `plugin.ConstructVolumeSpec recovered
-vol_data from global mount for specVolID %q` whenever the fallback fires,
+vol_data from global mount %s` whenever the fallback fires,
 and a similar V(2) line when the plugins directory scan registers an
 orphaned global mount as uncertain and when its directory is removed after
 a successful unstage.
@@ -583,7 +603,8 @@ reconstruction at kubelet startup.
 ###### Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?
 
 No. Two extra string fields per global `vol_data.json` (a few dozen bytes).
-Glob scan reads files that are already on disk.
+The fallback parses `/proc/self/mountinfo` and reads one file already on
+disk.
 
 ###### Can enabling / using this feature result in resource exhaustion of some node resources (PIDs, sockets, inodes, etc.)?
 
@@ -631,6 +652,11 @@ gate and report the bug.
   volume manager call `NodeUnstageVolume` before removing the directory
   (empty directories removed directly).
 - 2026-09-06: Retargeted to alpha in v1.38 and moved to `implementable`.
+- 2026-09-07: Replaced the specVolID directory scan with a lookup through the
+  mount table, which cannot pair an inline ephemeral volume with an unrelated
+  PersistentVolume of the same name, and needs no field an older kubelet did
+  not already write. Verified on a kind cluster running a kubelet built from
+  this branch.
 - 2026-09-07: Credited [#136771](https://github.com/kubernetes/kubernetes/pull/136771)
   as the existing implementation of the orphaned global mount scan, and corrected
   the Scalability and Troubleshooting answers, which had been written for the
