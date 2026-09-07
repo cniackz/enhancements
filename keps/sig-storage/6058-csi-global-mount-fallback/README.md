@@ -66,10 +66,11 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 When kubelet restarts, it reconstructs in-memory volume state from disk. For each
 pod-local mount it loads `vol_data.json`, which carries the data needed to
 rebuild a `volume.Spec`. If that file is missing or corrupt, reconstruction
-fails: the volume is added to `volumesFailedReconstruction`, `cleanupMounts`
-unmounts only the pod-local bind mount, and the global mount under
-`/var/lib/kubelet/plugins/kubernetes.io/csi/<driver>/<hash>/globalmount`
-remains live. The volume is removed from `node.status.volumesInUse`, the
+fails: the volume is added to `volumesFailedReconstruction`, and `cleanupMounts`
+cannot release it either, because building an unmounter reloads the same
+unreadable file. Neither the pod-local mount nor the global mount under
+`/var/lib/kubelet/plugins/kubernetes.io/csi/<driver>/<hash>/globalmount` is
+released. The volume is removed from `node.status.volumesInUse`, the
 attach/detach controller may then attach it to a different node, and a
 double-mount results. On RWO filesystems (FibreChannel, iSCSI, EBS, etc.) this
 corrupts data.
@@ -79,7 +80,7 @@ documented this case and prescribed manual operator intervention to clean up
 the leaked global mount. This KEP closes the loop for CSI volumes by making
 reconstruction recover automatically: `MountDevice` already writes a
 `vol_data.json` next to the global mount; we extend that file with the two
-fields needed to rebuild a `volume.Spec` (`specVolID` and
+fields that make it self-sufficient (`specVolID` and
 `volumeLifecycleMode`), and `ConstructVolumeSpec` falls back to it when the
 pod-local copy cannot be loaded. The fallback is gated behind a new alpha
 feature gate, `VolumeReconstructionFallback`.
@@ -179,8 +180,9 @@ contains everything `ConstructVolumeSpec` needs to rebuild a
 
 `ConstructVolumeSpec` is changed to fall back to the global file when the
 pod-local load fails. It asks the mount table which global mount the pod-local
-mount is bound to: `SetUpAt` bind mounts the global mount into the pod
-directory, so it is a mount reference of `<mountPath>/mount`, and the data
+mount is bound to: `NodePublishVolume` publishes the staged volume into the pod
+directory, which drivers implement as a bind mount from the staging path, so
+the global mount is a mount reference of `<mountPath>/mount` and the data
 directory is its parent. If no global mount is bind mounted there, or its
 `vol_data.json` names no driver and no volume handle, reconstruction fails as
 today.
@@ -258,8 +260,10 @@ volume detaches cleanly without operator involvement.
   is the case it exists for: reconstruction runs before `cleanupMounts`, and a
   global mount leaks precisely because nothing unmounted it.
 - Reading the mount table costs one parse of `/proc/self/mountinfo` per failed
-  pod-local load, through `GetReliableMountRefs`, which volume reconstruction
-  already uses elsewhere for the same reason.
+  pod-local load, through `GetReliableMountRefs`, which iSCSI and FibreChannel
+  reconstruction already use for the same reason. Reconstruction reads it once
+  per volume at startup; unmount generation reads it once per reconciler pass
+  for as long as a volume stays stuck without its pod-local file.
 - The orphaned global mount scan runs once per reconstruction pass (that
   is, once per kubelet startup), over the same bounded set of directories.
 
@@ -267,7 +271,7 @@ volume detaches cleanly without operator involvement.
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Wrong global mount is matched | None by construction | The pairing comes from the mount table, so the only global mount the fallback can return is the one this pod-local mount is bound to. An earlier revision matched on the directory name and could pair an inline ephemeral volume with an unrelated PV of the same name |
+| Wrong global mount is matched | Low | The candidate comes from the mount table, so it shares this pod-local mount's device. A driver that stages several volumes from one export can offer more than one, so the recovered `specVolID` must name the volume being reconstructed; a mismatch fails reconstruction rather than guessing. A pre-feature global file carries no `specVolID` and is accepted on the mount reference alone |
 | Global vol_data.json is also corrupt | Medium: same root cause may have hit both files | Fallback returns an error and reconstruction fails with the original message plus a wrapped fallback message; behavior matches the no-fallback case |
 | Feature gate disabled mid-cluster (skew) | Low | Field additions to global vol_data.json are written unconditionally (gate guards the read fallback only), so a node with the gate disabled still produces files a future enabled node can use |
 | Stale global mount data after volume detach | Low | Detach unmounts and removes the global mount directory along with `vol_data.json`; if detach failed previously this KEP is exactly what is supposed to recover from it |
@@ -276,8 +280,8 @@ volume detaches cleanly without operator involvement.
 
 ## Design Details
 
-The change touches three CSI files in `pkg/volume/csi`, plus the volume
-manager reconstruction pass:
+The change touches three CSI files in `pkg/volume/csi` (`csi_plugin.go` in two
+places), plus the volume manager reconstruction pass:
 
 1. `csi_attacher.go`: `MountDevice` adds `specVolID` (from `spec.Name()`) and
    `volumeLifecycleMode` (constant `string(storage.VolumeLifecyclePersistent)`)
@@ -287,9 +291,11 @@ manager reconstruction pass:
 
 2. `csi_util.go`: new helper `findGlobalMountDataFromPodMount(host, mountPath)`
    that asks the mount table which global mount the pod-local mount belongs to.
-   `SetUpAt` bind mounts the global mount into the pod directory, so
+   `NodePublishVolume` publishes the staged volume into the pod directory, which
+   drivers implement as a bind mount from the staging path, so
    `GetReliableMountRefs` on `<mountPath>/mount` returns it, and the data
-   directory is its parent. A reference is accepted when it is named
+   directory is its parent. A driver that publishes some other way leaves no
+   reference, and the fallback declines rather than guessing. A reference is accepted when it is named
    `globalmount` and the `vol_data.json` beside it names both a driver and a
    volume handle. References that fail either check are logged at V(4) and
    skipped; "no global mount is bind mounted here" is propagated up.
@@ -308,11 +314,37 @@ manager reconstruction pass:
    On error, if `VolumeReconstructionFallback` is enabled, it calls the helper
    and on success continues with the parsed map. On failure of both loads, it
    returns the original error plus the fallback error in a wrapped message.
-   The success path is unchanged. The case this fallback cannot reach, a
-   global mount whose pod-local bind mount is already gone, is what item 4
-   below covers by scanning independently of the pod directories.
+   The success path is unchanged. If the recovered data carries no `specVolID`,
+   which is the case for a global file staged by a kubelet older than this
+   feature, the `volumeName` argument is used instead: it is the name of the
+   pod directory, the same value `SetUpAt` would have stored. The case this
+   fallback cannot reach, a global mount whose pod-local bind mount is already
+   gone, is what item 5 below covers by scanning independently of the pod
+   directories.
 
-4. `pkg/kubelet/volumemanager` (reconstruction): after the existing scan of
+4. `csi_plugin.go`: `NewUnmounter` gets the same fallback, behind the same
+   gate, sharing the same helper. This is not symmetry for its own sake.
+   `GenerateUnmountVolumeFunc` builds the unmounter before it runs `TearDown`,
+   and `NewUnmounter` reads the same pod-local `vol_data.json` that item 3 had
+   to recover from, so without it the unmount operation is never generated at
+   all: the pod is never dropped from the ActualStateOfWorld,
+   `GetUnmountedVolumes` never returns the volume, `UnmountDevice` is never
+   reached, and the global mount stays exactly as orphaned as before. Rescuing
+   the spec without rescuing the unmount closes nothing.
+
+   The alternative, writing the recovered data back to the pod-local file so
+   that the existing `NewUnmounter` finds it, was rejected. That file has one
+   writer today, `SetUpAt`, and one remover, `removeMountDir`; reconstruction
+   is a reader, and adding a second writer to a directory that may be
+   mid-teardown is a larger change than the one this KEP makes. It would also
+   make a transient failure permanent: once written, the pod-local file parses,
+   the fallback condition no longer holds, and the recovery never runs again
+   for that volume, so a global mount that was matched wrongly stays matched
+   wrongly. And `saveVolumeData` truncates in place with no atomic rename, so a
+   repair that fails partway leaves a file an operator can no longer inspect to
+   see what was lost.
+
+5. `pkg/kubelet/volumemanager` (reconstruction): after the existing scan of
    `/var/lib/kubelet/pods`, a new step scans
    `/var/lib/kubelet/plugins/kubernetes.io/csi/*/*` and skips every
    directory whose volume is already tracked in the ActualStateOfWorld. For
@@ -353,7 +385,7 @@ None.
 
 Coverage for the changed packages:
 
-- `k8s.io/kubernetes/pkg/volume/csi`: 77.7%
+- `k8s.io/kubernetes/pkg/volume/csi`: 78%
 
 Unit tests in `pkg/volume/csi`, already part of the implementation PR
 [#138454](https://github.com/kubernetes/kubernetes/pull/138454), cover both
@@ -368,14 +400,20 @@ sides of the gate and the ways the lookup can go wrong:
    anything under the plugin directory.
 3. A pod mount with no mount references is reported as such rather than
    guessed at.
-4. A mount reference whose `vol_data.json` is unreadable or names no driver is
-   skipped rather than trusted.
+4. A mount reference whose `vol_data.json` is unreadable, or which names no
+   driver, is skipped rather than trusted.
+5. A global file with no `specVolID`, which is what a kubelet older than this
+   feature wrote, is named from the pod directory; one whose `specVolID` names
+   a different volume is refused rather than reconstructed.
+6. `NewUnmounter` recovers the driver name and volume handle from the global
+   mount with the gate on, and fails as before with the gate off.
 
-The pod-local path was also exercised end to end on a kind cluster running a
-kubelet built from this branch, confirming that a volume whose pod-local file
-was removed is recovered from its global mount and that a same-named inline
-volume is not. The orphaned global mount scan has no code on that branch yet,
-so it is not covered by that run.
+Both fallbacks were also exercised end to end on a kind cluster running a
+kubelet built from this branch, with a driver that stages and bind mounts and
+with the pod deleted, confirming that the rescued volume reaches
+`UnmountDevice` and that `NodeUnpublishVolume` and `NodeUnstageVolume` are
+called. The orphaned global mount scan has no code on that branch, so it is
+not covered by that run.
 
 For the orphaned global mount scan, new unit tests in
 `pkg/kubelet/volumemanager` will cover:
@@ -426,7 +464,7 @@ Tests will live in `test/e2e_node/csi_volume_reconstruction_test.go`.
 - Pod-local fallback implemented behind `VolumeReconstructionFallback`
   (default off), with unit tests for both gate states.
 - Orphaned global mount scan implemented behind the same gate, with unit
-  tests. Where that code lands is the open question in Design Details item 4:
+  tests. Where that code lands is the open question in Design Details item 5:
   either [#136771](https://github.com/kubernetes/kubernetes/pull/136771) gains
   the gate, or the scan is written here.
 - KEP merged.
@@ -495,21 +533,23 @@ fallback. No state recovery needed.
 
 ###### Are there any tests for feature enablement/disablement?
 
-The added unit test exercises both gate-on and gate-off paths.
+The added unit tests exercise both gate-on and gate-off paths.
 
 ### Rollout, Upgrade and Rollback Planning
 
 ###### How can a rollout or rollback fail? Can it impact already running workloads?
 
-The fallback runs only at kubelet startup during volume reconstruction.
-Already running workloads are unaffected: the code path is not reached for
-volumes that are already mounted and tracked in memory.
+The reconstruction fallback runs only at kubelet startup. The `NewUnmounter`
+fallback does not: it runs whenever the reconciler generates an unmount for a
+volume whose pod-local `vol_data.json` is unreadable, so for such a volume it
+parses `/proc/self/mountinfo` once per reconciler pass until the unmount
+succeeds. Volumes with an intact pod-local file never reach either path.
 
-A rollout failure would manifest as a spurious successful reconstruction
-that uses incorrect data. Mitigation: the global mount is identified by the
-mount reference the pod-local mount holds, not by a name that could be shared,
-so the only file the fallback can read is the one belonging to this very
-volume. The resulting `volume.Spec` is built from the same fields the
+A rollout failure would manifest as a spurious successful reconstruction that
+uses incorrect data. Mitigation: the candidate comes from the mount table
+rather than from a name that could be shared, and its stored `specVolID` must
+name the volume being reconstructed, so a global mount belonging to another
+volume is refused instead of used. The resulting `volume.Spec` is built from the same fields the
 pod-local file would have provided, so any downstream component that
 previously trusted the pod-local file can trust the global file.
 
@@ -537,7 +577,8 @@ No.
 ###### How can an operator determine if the feature is in use by workloads?
 
 At alpha: kubelet logs at V(2) emit `plugin.ConstructVolumeSpec recovered
-vol_data from global mount %s` whenever the fallback fires,
+vol_data from global mount %s` when reconstruction falls back, and `unmounter
+recovered vol_data from global mount %s` when unmount generation does,
 and a similar V(2) line when the plugins directory scan registers an
 orphaned global mount as uncertain and when its directory is removed after
 a successful unstage.
@@ -551,9 +592,11 @@ Look for the V(2) log line above; or, after beta, inspect the metric label.
 
 ###### What are the reasonable SLOs (Service Level Objectives) for the enhancement?
 
-The fallback should add no more than tens of milliseconds per reconstructed
-volume: one parse of `/proc/self/mountinfo` and one file read. It should not
-change overall kubelet startup time meaningfully.
+On the happy path the fallback costs one parse of `/proc/self/mountinfo` and
+one file read, tens of milliseconds. `GetReliableMountRefs` retries for up to
+one minute when the mount table reads inconsistently, so a pathological node
+can spend that long per attempt; kubelet startup does not block on it, the
+reconciler retries.
 
 ###### What are the SLIs (Service Level Indicators) an operator can use to determine the health of the service?
 
@@ -601,8 +644,9 @@ kubelet restart, which on a healthy node is zero.
 
 ###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
 
-Negligible. The added work runs only on the failure path of volume
-reconstruction at kubelet startup.
+Negligible for reconstruction, which runs once at startup. For a volume stuck
+without a pod-local `vol_data.json`, unmount generation adds one mount table
+parse per reconciler pass until the volume is released.
 
 ###### Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?
 
@@ -656,15 +700,19 @@ gate and report the bug.
   volume manager call `NodeUnstageVolume` before removing the directory
   (empty directories removed directly).
 - 2026-09-06: Retargeted to alpha in v1.38 and moved to `implementable`.
-- 2026-09-07: Replaced the specVolID directory scan with a lookup through the
-  mount table, which cannot pair an inline ephemeral volume with an unrelated
-  PersistentVolume of the same name, and needs no field an older kubelet did
-  not already write. Verified on a kind cluster running a kubelet built from
-  this branch.
 - 2026-09-07: Credited [#136771](https://github.com/kubernetes/kubernetes/pull/136771)
   as the existing implementation of the orphaned global mount scan, and corrected
   the Scalability and Troubleshooting answers, which had been written for the
   narrower pod-local design and no longer described the scan.
+- 2026-09-07: Replaced the specVolID directory scan with a lookup through the
+  mount table, which cannot pair an inline ephemeral volume with an unrelated
+  PersistentVolume of the same name, and needs no field an older kubelet did
+  not already write.
+- 2026-09-07: Gave `NewUnmounter` the same fallback, without which a rescued
+  volume could never be unmounted and its global mount stayed orphaned. Required
+  the recovered `specVolID` to name the volume being reconstructed, and fell back
+  to the `volumeName` argument when an older kubelet never wrote one. Verified on
+  a kind cluster running a kubelet built from this branch.
 
 ## Drawbacks
 
