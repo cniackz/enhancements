@@ -285,7 +285,7 @@ manager reconstruction pass:
    unconditional: written regardless of the feature gate, so a downgrade does
    not produce stale or partial files.
 
-2. `csi_util.go`: new helper `findGlobalMountDataFromPodMount(host, pluginName, mountPath)`
+2. `csi_util.go`: new helper `findGlobalMountDataFromPodMount(host, mountPath)`
    that asks the mount table which global mount the pod-local mount belongs to.
    `SetUpAt` bind mounts the global mount into the pod directory, so
    `GetReliableMountRefs` on `<mountPath>/mount` returns it, and the data
@@ -371,10 +371,11 @@ sides of the gate and the ways the lookup can go wrong:
 4. A mount reference whose `vol_data.json` is unreadable or names no driver is
    skipped rather than trusted.
 
-Both recovery paths were also exercised end to end on a kind cluster running a
+The pod-local path was also exercised end to end on a kind cluster running a
 kubelet built from this branch, confirming that a volume whose pod-local file
 was removed is recovered from its global mount and that a same-named inline
-volume is not.
+volume is not. The orphaned global mount scan has no code on that branch yet,
+so it is not covered by that run.
 
 For the orphaned global mount scan, new unit tests in
 `pkg/kubelet/volumemanager` will cover:
@@ -422,9 +423,12 @@ Tests will live in `test/e2e_node/csi_volume_reconstruction_test.go`.
 
 #### Alpha
 
-- Feature implemented behind `VolumeReconstructionFallback` (default off),
-  covering both the pod-local fallback and the orphaned global mount scan.
-- Unit tests for both recovery paths.
+- Pod-local fallback implemented behind `VolumeReconstructionFallback`
+  (default off), with unit tests for both gate states.
+- Orphaned global mount scan implemented behind the same gate, with unit
+  tests. Where that code lands is the open question in Design Details item 4:
+  either [#136771](https://github.com/kubernetes/kubernetes/pull/136771) gains
+  the gate, or the scan is written here.
 - KEP merged.
 
 #### Beta
@@ -433,7 +437,7 @@ Tests will live in `test/e2e_node/csi_volume_reconstruction_test.go`.
 - Metrics: increment `reconstruct_volume_operations_total` with a label
   distinguishing pod-local vs global-fallback success, so operators can see
   fallback frequency.
-- Two release cycles with no open bugs against the fallback path.
+- One release cycle at alpha with no open bugs against either recovery path.
 - Default gate flipped to on.
 
 #### GA
@@ -548,8 +552,8 @@ Look for the V(2) log line above; or, after beta, inspect the metric label.
 ###### What are the reasonable SLOs (Service Level Objectives) for the enhancement?
 
 The fallback should add no more than tens of milliseconds per reconstructed
-volume (one filesystem glob plus a small number of file reads). It should
-not change overall kubelet startup time meaningfully.
+volume: one parse of `/proc/self/mountinfo` and one file read. It should not
+change overall kubelet startup time meaningfully.
 
 ###### What are the SLIs (Service Level Indicators) an operator can use to determine the health of the service?
 
@@ -628,9 +632,9 @@ unwanted.
 - Both `vol_data.json` files corrupt: reconstruction fails with a wrapped
   error message naming both files. Operator intervention required, same as
   today.
-- Global plugin directory unreadable (permissions, filesystem error): the
-  glob returns an error which is wrapped and returned. Same operator
-  procedure as today.
+- Mount table unreadable, or the pod-local mount has no reference to any
+  global mount: the fallback returns an error which is wrapped alongside the
+  original one, and reconstruction fails as it does today.
 - Orphaned global mount directory that is not empty and has no readable
   `vol_data.json`: the scan logs an error and leaves the directory in
   place. Operator intervention required, same as today.
