@@ -536,25 +536,13 @@ The added unit tests exercise both gate-on and gate-off paths.
 
 ###### How can a rollout or rollback fail? Can it impact already running workloads?
 
-The reconstruction fallback runs only at kubelet startup. The `NewUnmounter`
-fallback does not: it runs whenever the reconciler generates an unmount for a
-volume whose pod-local `vol_data.json` is unreadable, so for such a volume it
-parses `/proc/self/mountinfo` once per reconciler pass until the unmount
-succeeds. Volumes with an intact pod-local file never reach either path.
-
-A rollout failure would manifest as a spurious successful reconstruction that
-uses incorrect data. Mitigation: the candidate comes from the mount table
-rather than from a name that could be shared, and its stored `specVolID` must
-name the volume being reconstructed, so a global mount belonging to another
-volume is refused instead of used. The resulting `volume.Spec` is built from the same fields the
-pod-local file would have provided, so any downstream component that
-previously trusted the pod-local file can trust the global file.
-
-For the orphaned global mount scan, the failure to watch for is unstaging a
-volume a pod still needs. The uncertain registration prevents that: the
-reconciler re-verifies mounts that are still in the desired state instead
-of unmounting them, and `NodeUnstageVolume` is only called for volumes no
-pod references.
+A volume with an intact pod-local file reaches neither path, so a rollout
+touches only volumes that fail today. The failure to watch for is a
+reconstruction that succeeds with the wrong data: the candidate comes from the
+mount table rather than from a name that could be shared, and its `specVolID`
+must name the volume being reconstructed. For the listing, the failure to watch
+for is unstaging a volume a pod still needs, which the uncertain registration
+prevents: the reconciler re-verifies anything still in the desired state.
 
 ###### What specific metrics should inform a rollback?
 
@@ -573,11 +561,10 @@ No.
 
 ###### How can an operator determine if the feature is in use by workloads?
 
-At alpha: kubelet logs at V(2) emit `plugin.ConstructVolumeSpec recovered
-vol_data from global mount %s` when reconstruction falls back, and `unmounter
-recovered vol_data from global mount %s` when unmount generation does,
-and `Global mount with no pod directory is marked uncertain and added into the
-actual state` when reconstruction picks up a volume no pod directory named.
+At alpha, three V(2) log lines: `plugin.ConstructVolumeSpec recovered vol_data
+from global mount`, `unmounter recovered vol_data from global mount`, and
+`Global mount with no pod directory is marked uncertain and added into the
+actual state`.
 
 The `reconstruct_volume_operations_total` metric already exists in kubelet at
 ALPHA stability, today as an unlabelled counter incremented once per pod
@@ -646,10 +633,10 @@ against detaching a device that is still staged: `processVolumesInUse` copies
 the list in as `MountedByNode`, and the detach reconciler skips anything
 carrying that flag unless a force detach or the `node.kubernetes.io/out-of-service`
 taint overrides it. A global mount that outlived a kubelet restart is still
-staged, so it belongs in that list by the field's own definition. Concretely:
-no new API objects, and one extra `UniqueVolumeName` entry per recovered mount
-that the node still has attached, on that node only, until `NodeUnstageVolume`
-completes. On a healthy node that count is zero.
+staged, so it belongs in that list by the field's own definition. No new API
+objects, and one extra `UniqueVolumeName` entry per recovered mount the node
+still has attached, until `NodeUnstageVolume` completes. On a healthy node that
+count is zero.
 
 ###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
 
