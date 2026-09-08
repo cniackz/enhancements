@@ -72,9 +72,9 @@ pod-local state file is unreadable, is invisible to it. A node drain reaches the
 first case with no corruption and no operator mistake.
 
 This KEP makes reconstruction find mounted volumes directly and finish their
-unmount, so a volume stays in `node.status.volumesInUse` until it is genuinely
-released. Behind an alpha feature gate, `CSIGlobalMountReconstruction`, default
-off.
+unmount, so that a volume kubelet is still holding is unstaged instead of being
+left for an operator to find. Behind an alpha feature gate,
+`CSIGlobalMountReconstruction`, default off.
 
 ## Motivation
 
@@ -103,11 +103,8 @@ in-memory record, since 2021, and reaches it by a second route. The pod-local
 condition that loses or corrupts it (disk full at write time, a partial write
 during shutdown, an operator deleting the directory while chasing a different
 problem, filesystem corruption) produces the same orphaned mount with the pod
-directory still in place. KEP-3756 made reconstruction robust against most
-kubelet bugs but kept that contract: an unreadable pod-local file means
-reconstruction fails and an operator must clean up by hand, as documented in
-its troubleshooting section. The window between the failed reconstruction and the
-controller re-attaching elsewhere is not one an operator is alerted to.
+directory still in place. KEP-3756 made reconstruction robust against
+most kubelet bugs and documented this case as one for manual cleanup.
 
 Both routes are recoverable from data already on disk. The global mount's own
 `vol_data.json`, written by `csiAttacher.MountDevice`, already stores
@@ -126,8 +123,8 @@ drivers.
   reconstruction ask each volume plugin for the global mounts it holds.
 - Recover the same mount when the pod directory is still there but its
   `vol_data.json` cannot be read, for reconstruction and for unmounting alike.
-- Keep `node.status.volumesInUse` accurate for the whole of that cleanup, so no
-  competing attach can start against a volume still staged here.
+- Report a recovered volume in `node.status.volumesInUse` while the node still
+  holds it, on the same terms as a volume reconstructed from a pod directory.
 - Keep the change additive: no behavior change on the path where reconstruction
   already succeeds, and leave the door open for other plugins with global
   mounts to reuse the same machinery.
@@ -141,15 +138,10 @@ drivers.
   their global mounts through an interface, so adding FC or iSCSI is
   implementing one call, not changing the volume manager. NFS does not use
   `MountDevice` and is unaffected.
-- The pod-local fallback for raw block volumes. Block volumes keep no pod-local
-  `vol_data.json` to lose: `NewBlockVolumeMapper` writes theirs to
-  `plugins/kubernetes.io/csi/volumeDevices/<specVolID>/data`, already
-  node-global, and both `ConstructBlockVolumeSpec` and `NewBlockVolumeUnmapper`
-  read it from there. Their pod-local artifact is a symlink rather than a bind
-  mount, so there is no mount reference to follow back either. The staging path a block
-  volume can still leak waits for beta: `MarkDeviceAsUncertain` records one path
-  per volume, while a block volume's staging, publish and device paths sit under
-  different roots, so `GlobalVolume` needs a volume mode first.
+- Raw block volumes. Their volume data is already node-global, so the pod-local
+  failure mode cannot happen for them, and the staging path they can still leak
+  waits for beta: `GlobalVolume` carries one path, while a block volume's
+  staging, publish and device paths sit under different roots.
 - Changing the CSI specification or any contract with drivers. Nothing here
   requires a driver change.
 - Recovering a volume whose global `vol_data.json` is also unreadable. With
@@ -173,8 +165,8 @@ the ActualStateOfWorld as *uncertain*, following the semantics KEP-3756
 introduced, and resolves it from there. A volume a pod still needs is
 re-verified; a volume no pod needs is unstaged through `NodeUnstageVolume` and
 its directory removed only after that succeeds. Registering the mount before
-touching it is what keeps it in `node.status.volumesInUse` for the whole
-cleanup, so no competing attach can start in the middle.
+touching it is what allows it to be reported in `node.status.volumesInUse`
+while the cleanup runs, so no competing attach starts in the middle.
 
 The layout of a global mount is the plugin's business, so the volume manager
 asks rather than globbing a path of its own. That is also what lets
@@ -182,14 +174,9 @@ FibreChannel and iSCSI reuse this machinery later by implementing one call.
 
 The scan starts from the plugin directory, so it cannot help the case where the
 pod directory is still present and it is the pod-local `vol_data.json` that is
-unreadable. For that, `ConstructVolumeSpec` is changed to fall back to the
-global file when the pod-local load fails. It asks the mount table which global mount the pod-local
-mount is bound to: `NodePublishVolume` publishes the staged volume into the pod
-directory, which drivers implement as a bind mount from the staging path, so
-the global mount is a mount reference of `<mountPath>/mount` and the data
-directory is its parent. If no global mount is bind mounted there, or its
-`vol_data.json` names no driver and no volume handle, reconstruction fails as
-today.
+unreadable. For that, `ConstructVolumeSpec` and `NewUnmounter` fall back to the
+global file, finding it through the bind mount the pod-local mount already
+holds. Where there is no such mount reference, reconstruction fails as today.
 
 ### User Stories
 
@@ -198,8 +185,7 @@ today.
 The drain completes because every pod finished `NodeUnpublishVolume`, the node
 reboots before `NodeUnstageVolume` does, and the volume is left staged with no
 pod directory naming it ([#121937][]). Reconstruction now finds it through the
-plugin, no pod claims it, and it is unstaged while still counted in
-`volumesInUse`.
+plugin, no pod claims it, and it is unstaged and released.
 
 #### Story 2: the pod-local vol_data.json is lost or corrupt
 
@@ -215,12 +201,11 @@ the normal unmount path.
   pod-local bind mount never comes back, since nothing outside kubelet
   recreates it. After a reboot no key rooted in the pod directory works, its
   name included, and the volume is recovered by the scan instead.
-- The scan can therefore reach `NodeUnstageVolume` for a volume this kubelet
-  never sent a `NodeUnpublishVolume` for. In the case this KEP is mainly about
-  the unpublish already succeeded before the reboot, so the CSI ordering
-  requirement was met in the node's previous life; where it did not, nothing is
-  published at that `target_path` any more and the spec has the driver answer
-  `0 OK`.
+- Recovery can therefore reach `NodeUnstageVolume` for a volume this kubelet
+  never sent a `NodeUnpublishVolume` for. In the drain case the unpublish
+  succeeded before the reboot, so the CSI ordering requirement was met in the
+  node's previous life; where it did not, nothing is published at that
+  `target_path` any more, and `NodeUnstageVolume` is required to be idempotent.
 - Listing global mounts happens once per reconstruction pass, that is, once
   per kubelet startup, and each plugin reads only the directories it staged.
 
@@ -258,16 +243,19 @@ from reconstruction, and a fallback in two CSI call sites:
    type GlobalVolume struct {
    	ReconstructedVolume // Spec, SELinuxMountContext
    	DeviceMountPath     string
+   	VolumeMode          v1.PersistentVolumeMode
    }
    ```
 
-   `FindGlobalVolumeListerPlugins` returns every plugin implementing it,
-   following `FindDeviceMountablePluginByName`. The interface only reads: what
+   `FindGlobalVolumeListerPlugins` returns every plugin implementing it. Unlike
+   the other `Find` helpers it takes neither a spec nor a name, because
+   reconstruction has neither when it starts: it asks each plugin what it holds. The interface only reads: what
    is on disk is removed by `UnmountDevice`, which already calls `removeMountDir`
    after a successful `NodeUnstageVolume`, so a recovered volume is cleaned up
    by the path every other volume takes.
 
-3. `csi_plugin.go`: the CSI implementation. It walks its own plugin directory,
+3. `csi_global_volumes.go`: the CSI implementation. It walks its own plugin
+   directory,
    loads each `vol_data.json`, and builds a spec with `constructPVSourceSpec`.
    It excludes its own `volumeDevices` subtree, the raw block subtree that is a
    sibling of the per-driver directories, by asking the host for that path
@@ -276,12 +264,16 @@ from reconstruction, and a fallback in two CSI call sites:
    load is skipped rather than reported, so one unreadable directory does not
    hide the volumes around it.
 
-   Every plugin with global mounts has a `volumeDevices` sibling of its own, at
-   a path only it can resolve, which is why the exclusion belongs here and not
-   in a glob the volume manager writes once for everyone. FibreChannel and
-   iSCSI can implement the same call when someone wants reconstruction for
-   them: both already rebuild their spec from the global directory name alone
-   (`parsePDName`, `extractPortalAndIqn`).
+   FibreChannel and iSCSI can implement the same call when someone wants
+   reconstruction for them: both already rebuild their spec from the global
+   directory name alone (`parsePDName`, `extractPortalAndIqn`), and each knows
+   its own exclusions, of which `volumeDevices` is one.
+
+   A directory is only reported if it is the one `MountDevice` would have
+   staged the volume its `vol_data.json` names, that is, `sha256(volumeHandle)`.
+   Without that check a directory holding another volume's data would be
+   unstaged at a path that is not itself, since the unmount recomputes the path
+   from the spec, and would report success while leaving this mount in place.
 
 4. `pkg/kubelet/volumemanager` (reconstruction): after the existing walk of
    `/var/lib/kubelet/pods`, reconstruction calls each such plugin and, for every
@@ -292,6 +284,28 @@ from reconstruction, and a fallback in two CSI call sites:
    re-verified, one no pod wants is unstaged and only then removed. The name is
    derived here rather than returned by the plugin, so that it matches what the
    desired state produces.
+
+   Two kinds of entry are declined before anything is registered. A volume the
+   plugin cannot device mount is skipped, because the desired state names that
+   kind by pod and there is no pod here to name it with, so unstaging it would
+   use a name the desired state never produces. A raw block volume is skipped
+   too: it reaches the ActualStateOfWorld through the block mapper rather than
+   through a device mount, which is why `GlobalVolume` carries a volume mode.
+   If marking the device fails after the volume was added, it is removed again
+   rather than left behind, since a volume with no pod and no mounted device
+   reads to the reconciler as one to detach.
+
+   Attachability is where a recovered volume differs from one that was never
+   lost. `AddAttachUncertainReconstructedVolume` records it as
+   attach-uncertain, and `GetVolumesInUse` reports only volumes whose
+   attachability resolved to true, so the volume is queued in
+   `volumesNeedUpdateFromNodeStatus` and settled on the next read of
+   `node.status.volumesAttached`: found there, it is reported in
+   `volumesInUse`; absent, the controller has already detached it and it is
+   not. That is how reconstruction from a pod directory behaves today. The
+   unstage does not depend on it either way, because `DeviceMayBeMounted` is
+   true for an uncertain device, and the same queue holds the reconciler back
+   from unmounting anything until that read succeeds.
 
    Two constraints follow. `GenerateUnmountDeviceFunc` recomputes the device
    mount path from the spec, and `GetVolumeName` derives the unique volume name
@@ -304,12 +318,9 @@ from reconstruction, and a fallback in two CSI call sites:
    logs; the unique name comes from the driver and handle, so those volumes are
    recovered too.
 
-   [#136771](https://github.com/kubernetes/kubernetes/pull/136771), opened by
-   @shivamwayal37 in February 2026 against [#121937][], reaches the same
-   ActualStateOfWorld state from the same directories. It reads the CSI layout
-   directly in the reconciler and carries no feature gate, which is what this
-   design moves behind the interface; the part that registers a pod-less volume
-   as uncertain is common to both.
+   Prior art: [#136771](https://github.com/kubernetes/kubernetes/pull/136771),
+   opened by @shivamwayal37 in February 2026 against [#121937][], reaches the
+   same ActualStateOfWorld state from the same directories.
 
 5. `csi_util.go`: new helper `findGlobalMountDataFromPodMount(host, mountPath)`
    that asks the mount table which global mount the pod-local mount belongs to.
@@ -322,18 +333,14 @@ from reconstruction, and a fallback in two CSI call sites:
    volume handle. References that fail either check are logged at V(4) and
    skipped; "no global mount is bind mounted here" is propagated up.
 
-   The mount table is what makes this unambiguous, and matching on the
-   directory name instead is not sound. `Spec.Name()` is the PV name for a
-   persistent volume but the pod-spec entry for an inline ephemeral one, and
-   those namespaces overlap, so a name like `data` denotes both; since an
-   inline volume never stages a global mount of its own, every name match it
-   could produce belongs to somebody else's volume. `volumeLifecycleMode` in
-   the global file cannot break that tie either: `MountDevice` writes it as the
-   constant `Persistent`, because `CanDeviceMount` is false for ephemeral, and
-   the real mode is recorded only in the pod-local file this fallback exists
-   because it cannot read. The mount table also works for global mounts staged
-   by a kubelet that predates this KEP, needing no field that was not already
-   written.
+   Matching on the directory name instead is not sound. `Spec.Name()` is the
+   PV name for a persistent volume but the pod-spec entry for an inline
+   ephemeral one, and those namespaces overlap, so a name like `data` denotes
+   both; since an inline volume never stages a global mount, every name match
+   it could produce belongs to somebody else's volume. `volumeLifecycleMode`
+   cannot break that tie, because `MountDevice` writes it as the constant
+   `Persistent` and the real mode lives only in the file this fallback exists
+   because it cannot read.
 
 6. `csi_plugin.go`: `ConstructVolumeSpec` calls `loadVolumeData` as today. On
    error, and with the gate on, it retries through the helper and continues
@@ -390,13 +397,15 @@ built from this branch, confirming the rescued volume reaches `UnmountDevice`
 and that `NodeUnpublishVolume` and `NodeUnstageVolume` are called. That run
 predates the listing interface and does not cover it.
 
-New unit tests will cover the scan on both sides of the interface: in
-`pkg/volume/csi`, that `ListGlobalVolumes` returns one entry per global mount
-with the real volume handle in the spec, skips `volumeDevices` and skips a
-directory whose volume data will not load; in `pkg/kubelet/volumemanager`, that
-a listed volume already in the ActualStateOfWorld is ignored, that one no pod
-wants is registered uncertain and then unstaged and removed in that order, and
-that with the gate off nothing is listed at all.
+Unit tests cover both sides of the interface. In `pkg/volume/csi`,
+`ListGlobalVolumes` returns one entry per global mount with the real volume
+handle in the spec, skips `volumeDevices`, skips a directory whose volume data
+will not load or names another volume, and still recovers one staged before this
+feature existed. In `pkg/volume`, only a plugin implementing the interface is
+returned. In `pkg/kubelet/volumemanager`, a listed volume is registered with an
+uncertain device and the reported mount path, one already tracked is left alone,
+a raw block volume is left to the block path, a plugin that cannot list is not
+fatal, and the gate is exercised in both positions.
 
 ##### Integration tests
 
@@ -576,9 +585,7 @@ volume directory reconstruction attempt, with
 `reconstruct_volume_operations_errors_total` counting the failures among them.
 As part of this KEP we plan to add a label to it distinguishing `pod-local`
 from `global-mount`, which turns the counter into a labelled one, a `NewCounter` to `NewCounterVec` change across its callers; its alpha
-stability allows that without a deprecation cycle. The orphaned global mount
-scan increments it too, so a mount recovered with no pod directory is counted
-rather than invisible.
+stability allows that without a deprecation cycle.
 
 ###### How can someone using this feature know that it is working for their instance?
 
@@ -639,10 +646,9 @@ against detaching a device that is still staged: `processVolumesInUse` copies
 the list in as `MountedByNode`, and the detach reconciler skips anything
 carrying that flag unless a force detach or the `node.kubernetes.io/out-of-service`
 taint overrides it. A global mount that outlived a kubelet restart is still
-staged, so it belongs in that list by the field's own definition, and its
-absence today is the defect that lets the controller attach the volume
-elsewhere. Concretely: no new API objects, one extra `UniqueVolumeName` entry
-per recovered mount, on the affected node only, until `NodeUnstageVolume`
+staged, so it belongs in that list by the field's own definition. Concretely:
+no new API objects, and one extra `UniqueVolumeName` entry per recovered mount
+that the node still has attached, on that node only, until `NodeUnstageVolume`
 completes. On a healthy node that count is zero.
 
 ###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
@@ -702,19 +708,13 @@ gate and report the bug.
   global mounts with no pod directory, rather than working from pod
   directories alone.
 - 2026-09-06: Retargeted to alpha in v1.38 and moved to `implementable`.
-- 2026-09-08: Moved the scan behind a volume plugin interface,
-  `GlobalVolumeListerPlugin`, per SIG Storage review: the volume manager asks
-  each plugin for its global mounts instead of reading the CSI directory layout
-  itself, so FibreChannel and iSCSI can reuse the same machinery. Removal
-  dropped from the interface, since `UnmountDevice` already removes the
-  directory after a successful unstage. Alpha now covers the scan.
-- 2026-09-07: Restructured so the scan leads the document, since it is the case
-  this KEP is mainly about; gate renamed to `CSIGlobalMountReconstruction`.
-  Credited [#136771](https://github.com/kubernetes/kubernetes/pull/136771) as
-  its existing implementation. Matching moved from a directory-name scan to the
-  mount table, which cannot pair an inline ephemeral volume with an unrelated
-  PersistentVolume of the same name. `NewUnmounter` given the same fallback,
-  without which a rescued volume is never unmounted. Verified on a kind cluster.
+- 2026-09-07: Restructured per SIG Storage review so that recovery of a mount
+  with no pod directory leads the document; gate renamed to
+  `CSIGlobalMountReconstruction`. Matching moved from directory names to the
+  mount table, and `NewUnmounter` given the same fallback.
+- 2026-09-08: Moved recovery behind `GlobalVolumeListerPlugin` per SIG Storage
+  review, so that the volume manager asks each plugin rather than reading the
+  CSI layout itself, and brought it into alpha.
 
 ## Drawbacks
 
@@ -731,15 +731,11 @@ an operator who has to notice it first.
    filesystem-level corruption, and atomic writes alone do not protect
    against disk-full at write time.
 
-2. Detect the orphaned global mount during cleanup and unmount it
-   defensively. Considered in early discussion of [#101791][]. The
-   problem is that by the time `cleanupMounts` runs, the volume has already
-   been removed from `volumesInUse`; the controller may have started a
-   competing attach. The fallback approach prevents the volume from leaving
-   `volumesInUse` in the first place. The orphaned global mount scan in
-   this KEP avoids that pitfall the same way: the mount is registered in
-   the ActualStateOfWorld first, so `volumesInUse` stays accurate until
-   `NodeUnstageVolume` completes.
+2. Detect the orphaned global mount during cleanup and unmount it defensively.
+   Considered in early discussion of [#101791][]. By the time `cleanupMounts`
+   runs the volume is out of the ActualStateOfWorld entirely, so nothing keeps
+   it from being reported as released mid-cleanup. Registering it first, which
+   is what this KEP does, is what puts it back under the normal unmount path.
 
 3. Reconstruct purely from `/proc/mounts`. Possible for some plugins but
    loses the spec information CSI needs (driver-specific options, lifecycle
