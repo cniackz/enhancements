@@ -333,7 +333,8 @@ from reconstruction, and a fallback in two CSI call sites:
    volume handle. References that fail either check are logged at V(4) and
    skipped; "no global mount is bind mounted here" is propagated up.
 
-   Matching on the directory name instead is not sound. `Spec.Name()` is the
+   Matching on the directory name instead of the mount table is not sound where
+   both are available. `Spec.Name()` is the
    PV name for a persistent volume but the pod-spec entry for an inline
    ephemeral one, and those namespaces overlap, so a name like `data` denotes
    both; since an inline volume never stages a global mount, every name match
